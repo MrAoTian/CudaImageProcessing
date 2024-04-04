@@ -154,6 +154,11 @@ void cudaGuidedFilterDemo(int argc, char** argv)
     CHECK(cudaMemcpy2D(hres.data, spitch1, d_dst, spitch2, spitch1, height, cudaMemcpyDeviceToHost));
     hres.convertTo(hres, CV_8U, 255.0);
     cv::imwrite(dst_path, hres);
+
+    // Free memory
+    CUDA_SAFE_FREE(d_src);
+    CUDA_SAFE_FREE(d_guidiance);
+    CUDA_SAFE_FREE(d_dst);
 }
 
 
