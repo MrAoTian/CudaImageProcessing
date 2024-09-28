@@ -4,7 +4,9 @@
 #include <opencv2/cudaarithm.hpp>
 
 
+/* Use this function to compare speed with OpenCV and NPPI */
 void integralDemo(int argc, char** argv);
+/* Use this function to verify the result */
 void autoTestDemo(int argc, char** argv);
 
 

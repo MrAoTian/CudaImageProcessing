@@ -2,6 +2,10 @@
 #include "cuda_utils.h"
 
 
+////////////////// Warm up //////////////////
+void hWarmUp(unsigned char* src, unsigned char* dst, int width, int height, int stride);
+
+
 ////////////////// Histogram equalization //////////////////
 
 // Compute histogram

@@ -1,8 +1,11 @@
 #include "hist_equalization.h"
 #include "clahe.h"
 #include "cuda_utils.h"
+#include "image_process.h"
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/cudaarithm.hpp>
+#include <opencv2/cudaimgproc.hpp>
 
 
 void heDemo(int argc, char** argv);
@@ -57,9 +60,10 @@ void heDemo(int argc, char** argv)
     cv::equalizeHist(image, hres);
     CHECK(cudaMemcpy2D(dres.data, spitch, d_dst, dpitch, spitch, height, cudaMemcpyDeviceToHost));
 
-    std::string dst_path1 = "../data/night_gray.png";
-    std::string dst_path2 = "../data/night_cvhe.png";
-    std::string dst_path3 = "../data/night_cudahe.png";
+    std::string basepath = src_path.substr(0, src_path.rfind("."));
+    std::string dst_path1 = basepath + "_gray.png";
+    std::string dst_path2 = basepath + "_cvhe.png";
+    std::string dst_path3 = basepath + "_cudahe.png";
     cv::imwrite(dst_path1, image);
     cv::imwrite(dst_path2, hres);
     cv::imwrite(dst_path3, dres);
@@ -92,10 +96,16 @@ void claheDemo(int argc, char** argv)
     const int width = image.cols;
     const int height = image.rows;
 
+    // To LAB
     cv::Mat lab;
     std::vector<cv::Mat> lab_channels;
     cv::cvtColor(image, lab, cv::COLOR_BGR2Lab);
     cv::split(lab, lab_channels);
+
+    // Allocate memory for result
+    cv::Mat hres(height, width, CV_8UC1);
+    cv::Mat cures(height, width, CV_8UC1);
+    cv::Mat cvres(height, width, CV_8UC1);
     
     // Allocate memory on device 
     unsigned char* d_src = nullptr;
@@ -106,39 +116,73 @@ void claheDemo(int argc, char** argv)
     CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_dst), &dpitch, spitch, height));
     CHECK(cudaMemcpy2D(d_src, dpitch, lab_channels[0].data, spitch, spitch, height, cudaMemcpyHostToDevice));    
     const int stride = dpitch / sizeof(unsigned char);
-    
-    // Initialize histogram equalization
+
+    cv::cuda::GpuMat d_srcmat(height, width, CV_8UC1);
+    cv::cuda::GpuMat d_dstmat(height, width, CV_8UC1);
+    d_srcmat.upload(lab_channels[0]);
+
+    // Initialize CLAHE by OpenCV
+    cv::Ptr<cv::cuda::CLAHE> cvcu_claher = cv::cuda::createCLAHE(clip_limit, cv::Size(xtiles, ytiles));    
+
+    // Initialize CLAHE by myself
     std::shared_ptr<Claher> cuda_claher = std::make_shared<Claher>();
     cuda_claher->init(clip_limit, xtiles, ytiles);
+    CHECK(cudaDeviceSynchronize());
 
-    // Forward
+    // Warm up
+    hWarmUp(d_src, d_dst, width, height, stride);
+    CHECK(cudaDeviceSynchronize());
+
+    // CUDA CLAHE by OpenCV
+    cvcu_claher->apply(d_srcmat, d_dstmat);
+    CHECK(cudaDeviceSynchronize());
+
+    // CUDA CLAHE by myself
     cuda_claher->run(d_src, d_dst, width, height, stride);
+    CHECK(cudaDeviceSynchronize());
+
+    // Cpu CLAHE by OpenCV
+    cv::Ptr<cv::CLAHE> cv_claher = cv::createCLAHE(clip_limit, cv::Size(xtiles, ytiles));
+
+    auto t0 = cpuTimer();
+    cv_claher->apply(lab_channels[0], hres);
+    auto t1 = cpuTimer();
+
+    // Static time. CPU time by code. GPU time by nsight/nvprof
+    printf("Time of OpenCV: %fms\n", (t1 - t0) * 0.001f);
 
     // Copy result to host
-    cv::Mat hres(height, width, CV_8UC1);
-    cv::Mat dres(height, width, CV_8UC1);
-    cv::Ptr<cv::CLAHE> cv_claher = cv::createCLAHE(clip_limit, cv::Size(xtiles, ytiles));
-    cv_claher->apply(lab_channels[0], hres);
-    CHECK(cudaMemcpy2D(dres.data, spitch, d_dst, dpitch, spitch, height, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy2D(cures.data, spitch, d_dst, dpitch, spitch, height, cudaMemcpyDeviceToHost));
+    d_dstmat.download(cvres);
 
-    cv::Mat hlab, dlab;
+    // Merge LAB
+    cv::Mat hlab, culab, cvlab;
     cv::merge(std::vector<cv::Mat>{hres, lab_channels[1], lab_channels[2]}, hlab);
-    cv::merge(std::vector<cv::Mat>{dres, lab_channels[1], lab_channels[2]}, dlab);
+    cv::merge(std::vector<cv::Mat>{cures, lab_channels[1], lab_channels[2]}, culab);
+    cv::merge(std::vector<cv::Mat>{cvres, lab_channels[1], lab_channels[2]}, cvlab);
 
-    cv::Mat hbgr, dbgr;
+    // Convert to BGR
+    cv::Mat hbgr, cubgr, cvbgr;
     cv::cvtColor(hlab, hbgr, cv::COLOR_Lab2BGR);
-    cv::cvtColor(dlab, dbgr, cv::COLOR_Lab2BGR);
+    cv::cvtColor(culab, cubgr, cv::COLOR_Lab2BGR);
+    cv::cvtColor(cvlab, cvbgr, cv::COLOR_Lab2BGR);
 
-    std::string dst_path1 = "../data/night_L.png";
-    std::string dst_path2 = "../data/night_cv_clahe.png";
-    std::string dst_path3 = "../data/night_cuda_clahe.png";
-    std::string dst_path4 = "../data/night_bgr_cv_clahe.png";
-    std::string dst_path5 = "../data/night_bgr_cuda_clahe.png";
+    // Save result
+    std::string basepath = src_path.substr(0, src_path.rfind("."));
+    std::string dst_path1 = basepath + "_L.png";
+    std::string dst_path2 = basepath + "_cv_clahe.png";
+    std::string dst_path3 = basepath + "_cuda_clahe.png";
+    std::string dst_path4 = basepath + "_cvcu_clahe.png";
+    std::string dst_path5 = basepath + "_bgr_cv_clahe.png";
+    std::string dst_path6 = basepath + "_bgr_cuda_clahe.png";
+    std::string dst_path7 = basepath + "_bgr_cvcu_clahe.png";
     cv::imwrite(dst_path1, lab_channels[0]);
     cv::imwrite(dst_path2, hres);
-    cv::imwrite(dst_path3, dres);
-    cv::imwrite(dst_path4, hbgr);
-    cv::imwrite(dst_path5, dbgr);
+    cv::imwrite(dst_path3, cures);
+    cv::imwrite(dst_path4, cvres);
+    cv::imwrite(dst_path5, hbgr);
+    cv::imwrite(dst_path6, cubgr);
+    cv::imwrite(dst_path7, cvbgr);
 
     // Free
     CUDA_SAFE_FREE(d_src);

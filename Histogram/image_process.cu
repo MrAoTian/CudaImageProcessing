@@ -1,6 +1,28 @@
 #include "image_process.h"
 
 
+////////////////// Warm up //////////////////
+__global__ void gWarmUp(unsigned char* src, unsigned char* dst, int width, int height, int stride)
+{
+    int ix = blockIdx.x * blockDim.x + threadIdx.x;
+    int iy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (ix < width && iy < height)
+    {
+        int idx = iy * stride + ix;
+        dst[idx] = src[idx] * 1000;
+    }    
+}
+
+
+void hWarmUp(unsigned char* src, unsigned char* dst, int width, int height, int stride)
+{
+    dim3 block(32, 32);
+    dim3 grid(iDivUp(width, block.x), iDivUp(height, block.y));
+    gWarmUp<<<grid, block>>>(src, dst, width, height, stride);
+}
+
+
+
 ////////////////// Histogram equalization //////////////////
 
 
@@ -148,9 +170,7 @@ void hMapping(unsigned char* src, unsigned char* dst, unsigned char* table, int 
 
 __inline__ __device__ int dLimitSize(int x, int sz)
 {
-    if (x < 0) return -x;
-    else if (x >= sz) return sz + sz - 2 - x;
-    else return x;
+    return x < 0 ? -x : (x >= sz ? sz + sz - 2 - x : x);
 }
 
 
@@ -182,8 +202,40 @@ __global__ void gCalcTileHists(unsigned char* src, int* hists, int xtiles, int y
             __syncthreads();
         }        
     }
-    
-    
+}
+
+
+__global__ void gCalcTileHistsUnroll(unsigned char* src, int* hists, int xtiles, int ytiles, int tile_width, int tile_height, int pad_left, int pad_top, int width, int height, int stride)
+{
+    __shared__ int shist[256];
+    const int ix = blockIdx.x * NX * 8 + threadIdx.x;
+    const int iy = blockIdx.y * NY + threadIdx.y;
+    const int tid = threadIdx.y * NX + threadIdx.x;
+    const int ity = blockIdx.z / xtiles;
+    const int itx = blockIdx.z % xtiles;
+
+    shist[tid] = 0;
+    __syncthreads();
+
+    if (iy < tile_height)
+    {
+        const int systart = dLimitSize(iy + ity * tile_height - pad_top, height) * stride;
+        const int xoffset = itx * tile_width - pad_left;
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+        {
+            int ix_ = ix + i * NX;
+            if (ix_ >= tile_width)
+            {
+                break;
+            }
+            atomicAdd(shist + src[systart + dLimitSize(xoffset + ix_, width)], 1);
+        }       
+    }   
+    __syncthreads();
+
+    int* curr_hist = hists + ((ity * xtiles + itx) << 8);
+    atomicAdd(curr_hist + tid, shist[tid]);
 }
 
 
@@ -266,7 +318,7 @@ __global__ void gCreateTable(int* hists, float* table, float fr)
     curr_table[tdx2] = __fmul_rn(cumu_hist[tdx2p], fr);
     if (tdx < 127)
     {
-        curr_table[tdx2p] = __fmul_rn(cumu_hist[tdx2pp], fr);    
+        curr_table[tdx2p] = __fmul_rn(cumu_hist[tdx2pp], fr);
     }
     else
     {
@@ -373,12 +425,64 @@ __global__ void gInterpolateMapping(unsigned char* src, unsigned char* dst, floa
 }
 
 
+__global__ void gInterpolateMappingUnroll(unsigned char* src, unsigned char* dst, float* tables, int xtiles, int ytiles, int tile_width, int tile_height, int pad_left, int pad_top, int width, int height, int stride)
+{
+    int ix = blockIdx.x * NX * 8 + threadIdx.x;
+    int iy = blockIdx.y * NY + threadIdx.y;
+    if (iy >= height)
+    {
+        return;
+    }
+
+    const float tyf = __fdiv_rn(iy + pad_top, tile_height) - 0.5f;
+    const int ty1 = __float2int_rz(tyf);
+    const int ty2 = min(ty1 + 1, ytiles - 1);
+    const float ya = tyf - ty1;
+    const float ya1 = 1.0f - ya;
+    const int tystart1 = ty1 * xtiles;
+    const int tystart2 = ty2 * xtiles;
+    const int ystart = iy * stride;
+    const float inv_tw = __frcp_rn(tile_width);
+
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+    {
+        const int ix_ = ix + i * NX;
+        if (ix_ >= width)
+        {
+            return;
+        }
+
+        const float txf = __fmul_rn(ix_ + pad_left, inv_tw) - 0.5f;
+        const int tx1 = __float2int_rz(txf);
+        const int tx2 = min(tx1 + 1, xtiles - 1);
+        const float xa = txf - tx1;
+        const float xa1 = 1.0f - xa;
+
+        const float* table1 = tables + ((tystart1 + tx1) << 8);
+        const float* table2 = tables + ((tystart1 + tx2) << 8);
+        const float* table3 = tables + ((tystart2 + tx1) << 8);
+        const float* table4 = tables + ((tystart2 + tx2) << 8);
+
+        const int idx = ystart + ix_;
+        const int ti = src[idx];
+        dst[idx] = (table1[ti] * xa1 + table2[ti] * xa) * ya1 + (table3[ti] * xa1 + table4[ti] * xa) * ya;
+    }
+}
+
+
+
 
 void hCalcTileHists(unsigned char* src, int* hists, int xtiles, int ytiles, int tile_width, int tile_height, int pad_left, int pad_top, int width, int height, int stride)
 {
+    // Naive
     dim3 block(NX, NY);
-    dim3 grid(iDivUp(tile_width, NX), iDivUp(tile_height, NY));
-    gCalcTileHists<<<grid, block>>>(src, hists, xtiles, ytiles, tile_width, tile_height, pad_left, pad_top, width, height, stride);
+    // dim3 grid(iDivUp(tile_width, NX), iDivUp(tile_height, NY));
+    // gCalcTileHists<<<grid, block>>>(src, hists, xtiles, ytiles, tile_width, tile_height, pad_left, pad_top, width, height, stride);
+
+    // Unroll
+    dim3 grid1(iDivUp(tile_width, NX * 8), iDivUp(tile_height, NY), xtiles * ytiles);
+    gCalcTileHistsUnroll<<<grid1, block>>>(src, hists, xtiles, ytiles, tile_width, tile_height, pad_left, pad_top, width, height, stride);
 }
 
 
@@ -398,6 +502,10 @@ void hCreateTable(int* hists, float* tables, int tile_pixels, int ntiles)
 void hInterpolateMapping(unsigned char* src, unsigned char* dst, float* tables, int xtiles, int ytiles, int tile_width, int tile_height, int pad_left, int pad_top, int width, int height, int stride)
 {
     dim3 block(NX, NY);
-    dim3 grid(iDivUp(width, NX), iDivUp(height, NY));
-    gInterpolateMapping<<<grid, block>>>(src, dst, tables, xtiles, ytiles, tile_width, tile_height, pad_left, pad_top, width, height, stride);
+    // dim3 grid(iDivUp(width, NX), iDivUp(height, NY));
+    // gInterpolateMapping<<<grid, block>>>(src, dst, tables, xtiles, ytiles, tile_width, tile_height, pad_left, pad_top, width, height, stride);
+    
+    dim3 grid1(iDivUp(width, NX * 8), iDivUp(height, NY));
+    gInterpolateMappingUnroll<<<grid1, block>>>(src, dst, tables, xtiles, ytiles, tile_width, tile_height, pad_left, pad_top, width, height, stride);
 }
+
