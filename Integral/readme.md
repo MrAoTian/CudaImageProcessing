@@ -30,3 +30,4 @@ Max difference of CUDA: 0.000000
 ## 正确性实验
 激活函数**autoTestDemo**，重复若干次实验，每次实验随机生成不同尺寸的图像，对比NPPI的结果均一致，详情见[res.log](res.log)
 
+知乎：https://zhuanlan.zhihu.com/p/745294835
