@@ -17,3 +17,5 @@ void hCalcB(float* b, float* a, float* pm, float* im, const int4& swhcs, const i
 /* Linear transform */
 void hLinearTransform(float* src, float* dst, float* a, float* b, const int4& swhcs, const int4& dwhcs);
 
+/* Guided filter for one channel */
+void hGuidedFilter(float* d_guided, float* d_src, float* d_dst, float* d_A, float* d_B, float eps, int radius, int width, int height, int stride);

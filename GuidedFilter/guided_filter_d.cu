@@ -412,6 +412,452 @@ __global__ void gLinearTransformCN1(float* src, float* dst, float* a, float* b, 
 }
 
 
+__device__ __inline__ int reflectBorder(int x, int sz)
+{
+    return x < 0 ? -x : (x >= sz ? sz + sz - 2 - x : x);
+}
+
+
+template <const int RADIUS, const int KX>
+__global__ void gCalcAB(const float* __restrict__ guidiance, const float* __restrict__ src, float* __restrict__ A, float* __restrict__ B, float eps, float coef, int width, int height, int stride)
+{
+    __shared__ float P[RADIUS * 2][KX + RADIUS * 2];
+    __shared__ float I[RADIUS * 2][KX + RADIUS * 2];
+    __shared__ float Pm[RADIUS * 4][KX];
+    __shared__ float Im[RADIUS * 4][KX];
+    __shared__ float IPm[RADIUS * 4][KX];
+    __shared__ float IIm[RADIUS * 4][KX];
+
+    const int R2 = RADIUS << 1;
+    const int R4 = RADIUS << 2;
+    const int R8 = RADIUS << 3;
+    const int tix = threadIdx.x;
+    const int tiy = threadIdx.y;
+    const int ix = blockIdx.x * KX + tix;
+    const int iy = blockIdx.y * R8 + tiy;
+    int xs[R2 + 1];
+    xs[RADIUS] = reflectBorder(ix, width);
+    for (int i = 1; i <= RADIUS; ++i)
+    {
+        xs[RADIUS - i] = reflectBorder(ix - i, width);
+        xs[RADIUS + i] = reflectBorder(ix + i, width);
+    }
+    const int six = tix + RADIUS;
+    const int pix = tix + R2;
+    const bool left_cond = tix < RADIUS;
+    const bool righ_cond = six >= KX || ix + RADIUS >= width;
+    int piy, siy, niy, offset, ny;
+    float p1, p2, i1, i2, pmu, imu, ipmu, iimu;
+
+    // First radius range - Load data to shared memory
+    offset = reflectBorder(iy - RADIUS, height) * stride;
+    P[tiy][six] = src[offset + xs[RADIUS]];
+    I[tiy][six] = guidiance[offset + xs[RADIUS]];
+    if (left_cond)
+    {
+        P[tiy][tix] = src[offset + xs[0]];
+        I[tiy][tix] = guidiance[offset + xs[0]];
+    }
+    if (righ_cond)
+    {
+        P[tiy][pix] = src[offset + xs[R2]];
+        I[tiy][pix] = guidiance[offset + xs[R2]];
+    }
+    __syncthreads();
+
+    // Second ~ 4th radius range
+#pragma unroll
+    for (int range = RADIUS; range < R4; range += RADIUS)
+    {
+        // Load data to shared memory
+        piy = (tiy + range) % R2;
+        offset = reflectBorder(iy + range - RADIUS, height) * stride;
+        P[piy][six] = src[offset + xs[RADIUS]];
+        I[piy][six] = guidiance[offset + xs[RADIUS]];
+        if (left_cond)
+        {
+            P[piy][tix] = src[offset + xs[0]];
+            I[piy][tix] = guidiance[offset + xs[0]];
+        }
+        if (righ_cond)
+        {
+            P[piy][pix] = src[offset + xs[R2]];
+            I[piy][pix] = guidiance[offset + xs[R2]];
+        }
+
+        // Reduce row for last-radius 
+        siy = tiy + range - RADIUS;
+        piy = siy % R2;
+        p1 = P[piy][six];
+        i1 = I[piy][six];
+        pmu = p1;
+        imu = i1;
+        ipmu = p1 * i1;
+        iimu = i1 * i1;
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            p1 = P[piy][six - i]; p2 = P[piy][six + i];
+            i1 = I[piy][six - i]; i2 = I[piy][six + i];
+            pmu += p1 + p2;
+            imu += i1 + i2;
+            ipmu += p1 * i1 + p2 * i2;
+            iimu += i1 * i1 + i2 * i2;
+        }
+        Pm[siy][tix] = pmu;
+        Im[siy][tix] = imu;
+        IPm[siy][tix] = ipmu;
+        IIm[siy][tix] = iimu;
+        __syncthreads();
+    }
+
+    // 4th -> radius range 
+#pragma unroll
+    for (int range = RADIUS; range < R8 - RADIUS; range += RADIUS)
+    {
+        // Load data to shared memory
+        siy = tiy + range;
+        piy = (siy + RADIUS) % R2;  // (siy + R3) % R2;
+        offset = reflectBorder(iy + range + R2, height) * stride;
+        P[piy][six] = src[offset + xs[RADIUS]];
+        I[piy][six] = guidiance[offset + xs[RADIUS]];
+        if (left_cond)
+        {
+            P[piy][tix] = src[offset + xs[0]];
+            I[piy][tix] = guidiance[offset + xs[0]];
+        }
+        if (righ_cond)
+        {
+            P[piy][pix] = src[offset + xs[R2]];
+            I[piy][pix] = guidiance[offset + xs[R2]];
+        }
+
+        // Reduce col and save result to dst
+        ny = iy + range - RADIUS;
+        if (ix < width && ny < height)
+        {
+            piy = siy % R4;
+            pmu = Pm[piy][tix];
+            imu = Im[piy][tix];
+            ipmu = IPm[piy][tix];
+            iimu = IIm[piy][tix];
+            for (int i = 1; i <= RADIUS; ++i)
+            {
+                piy = (siy - i) % R4;
+                niy = (siy + i) % R4;
+                pmu += Pm[piy][tix] + Pm[niy][tix];
+                imu += Im[piy][tix] + Im[niy][tix];
+                ipmu += IPm[piy][tix] + IPm[niy][tix];
+                iimu += IIm[piy][tix] + IIm[niy][tix];
+            }
+            pmu *= coef;
+            imu *= coef;
+            ipmu *= coef;
+            iimu *= coef;
+            ipmu = (ipmu - pmu * imu) / (iimu - imu * imu + eps);   // ipmu -> a
+            niy = ny * stride + ix; // niy -> index
+            A[niy] = ipmu;
+            B[niy] = pmu - ipmu * imu;
+        }    
+
+        // Reduce row for last-radius
+        siy += R2;
+        piy = siy % R2;
+        siy = siy % R4;
+        p1 = P[piy][six];
+        i1 = I[piy][six];
+        pmu = p1;
+        imu = i1;
+        ipmu = p1 * i1;
+        iimu = i1 * i1;
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            p1 = P[piy][six - i]; p2 = P[piy][six + i];
+            i1 = I[piy][six - i]; i2 = I[piy][six + i];
+            pmu += p1 + p2;
+            imu += i1 + i2;
+            ipmu += p1 * i1 + p2 * i2;
+            iimu += i1 * i1 + i2 * i2;
+        }
+        Pm[siy][tix] = pmu;
+        Im[siy][tix] = imu;
+        IPm[siy][tix] = ipmu;
+        IIm[siy][tix] = iimu;
+        __syncthreads();
+    }
+
+    // Last 2 range
+    if (ix < width)
+    {
+        // Reduce row for last-radius
+        siy = tiy + R8 + RADIUS;
+        piy = siy % R2;
+        siy = siy % R4;
+        p1 = P[piy][six];
+        i1 = I[piy][six];
+        pmu = p1;
+        imu = i1;
+        ipmu = p1 * i1;
+        iimu = i1 * i1;
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            p1 = P[piy][six - i]; p2 = P[piy][six + i];
+            i1 = I[piy][six - i]; i2 = I[piy][six + i];
+            pmu += p1 + p2;
+            imu += i1 + i2;
+            ipmu += p1 * i1 + p2 * i2;
+            iimu += i1 * i1 + i2 * i2;
+        }
+        Pm[siy][tix] = pmu;
+        Im[siy][tix] = imu;
+        IPm[siy][tix] = ipmu;
+        IIm[siy][tix] = iimu;
+
+        // Reduce col and save result to dst. -2
+        ny = iy + R8 - R2;
+        if (ny >= height) return;        
+        siy = tiy + R8 - RADIUS;
+        piy = siy % R4;
+        pmu = Pm[piy][tix];
+        imu = Im[piy][tix];
+        ipmu = IPm[piy][tix];
+        iimu = IIm[piy][tix];
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            piy = (siy - i) % R4;
+            niy = (siy + i) % R4;
+            pmu += Pm[piy][tix] + Pm[niy][tix];
+            imu += Im[piy][tix] + Im[niy][tix];
+            ipmu += IPm[piy][tix] + IPm[niy][tix];
+            iimu += IIm[piy][tix] + IIm[niy][tix];
+        }
+        pmu *= coef;
+        imu *= coef;
+        ipmu *= coef;
+        iimu *= coef;
+        ipmu = (ipmu - pmu * imu) / (iimu - imu * imu + eps);   // ipmu -> a
+        niy = ny * stride + ix; // niy -> index
+        A[niy] = ipmu;
+        B[niy] = pmu - ipmu * imu;
+
+        // Reduce col and save result to dst. -1
+        ny += RADIUS;
+        if (ny >= height) return;        
+        siy += RADIUS;
+        piy = siy % R4;
+        pmu = Pm[piy][tix];
+        imu = Im[piy][tix];
+        ipmu = IPm[piy][tix];
+        iimu = IIm[piy][tix];
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            piy = (siy - i) % R4;
+            niy = (siy + i) % R4;
+            pmu += Pm[piy][tix] + Pm[niy][tix];
+            imu += Im[piy][tix] + Im[niy][tix];
+            ipmu += IPm[piy][tix] + IPm[niy][tix];
+            iimu += IIm[piy][tix] + IIm[niy][tix];
+        }
+        pmu *= coef;
+        imu *= coef;
+        ipmu *= coef;
+        iimu *= coef;
+        ipmu = (ipmu - pmu * imu) / (iimu - imu * imu + eps);   // ipmu -> a
+        niy = ny * stride + ix; // niy -> index
+        A[niy] = ipmu;
+        B[niy] = pmu - ipmu * imu;
+    }
+}
+
+
+template <const int RADIUS, const int KX>
+__global__ void gWeightByABm(const float* __restrict__ guidiance, const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ dst, float coef, int width, int height, int stride)
+{
+    __shared__ float As[RADIUS * 2][KX + RADIUS * 2];
+    __shared__ float Bs[RADIUS * 2][KX + RADIUS * 2];
+    __shared__ float Am[RADIUS * 4][KX];
+    __shared__ float Bm[RADIUS * 4][KX];
+
+    const int R2 = RADIUS << 1;
+    const int R4 = RADIUS << 2;
+    const int R8 = RADIUS << 3;
+    const int tix = threadIdx.x;
+    const int tiy = threadIdx.y;
+    const int ix = blockIdx.x * KX + tix;
+    const int iy = blockIdx.y * R8 + tiy;
+    int xs[R2 + 1];
+    xs[RADIUS] = reflectBorder(ix, width);
+    for (int i = 1; i <= RADIUS; ++i)
+    {
+        xs[RADIUS - i] = reflectBorder(ix - i, width);
+        xs[RADIUS + i] = reflectBorder(ix + i, width);
+    }
+    const int six = tix + RADIUS;
+    const int pix = tix + R2;
+    const bool left_cond = tix < RADIUS;
+    const bool righ_cond = six >= KX || ix + RADIUS >= width;
+    int piy, siy, niy, offset, ny;
+    float amu, bmu;
+
+    // First radius range - Load data to shared memory
+    offset = reflectBorder(iy - RADIUS, height) * stride;
+    As[tiy][six] = A[offset + xs[RADIUS]];
+    Bs[tiy][six] = B[offset + xs[RADIUS]];
+    if (left_cond)
+    {
+        As[tiy][tix] = A[offset + xs[0]];
+        Bs[tiy][tix] = B[offset + xs[0]];
+    }
+    if (righ_cond)
+    {
+        As[tiy][pix] = A[offset + xs[R2]];
+        Bs[tiy][pix] = B[offset + xs[R2]];
+    }
+    __syncthreads();
+
+    // Second ~ 4th radius range
+#pragma unroll
+    for (int range = RADIUS; range < R4; range += RADIUS)
+    {
+        // Load data to shared memory
+        piy = (tiy + range) % R2;
+        offset = reflectBorder(iy + range - RADIUS, height) * stride;
+        As[piy][six] = A[offset + xs[RADIUS]];
+        Bs[piy][six] = B[offset + xs[RADIUS]];
+        if (left_cond)
+        {
+            As[piy][tix] = A[offset + xs[0]];
+            Bs[piy][tix] = B[offset + xs[0]];
+        }
+        if (righ_cond)
+        {
+            As[piy][pix] = A[offset + xs[R2]];
+            Bs[piy][pix] = B[offset + xs[R2]];
+        }
+
+        // Reduce row for last-radius 
+        siy = tiy + range - RADIUS;
+        piy = siy % R2;
+        amu = As[piy][six];
+        bmu = Bs[piy][six];
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            amu += As[piy][six - i] + As[piy][six + i];
+            bmu += Bs[piy][six - i] + Bs[piy][six + i];
+        }
+        Am[siy][tix] = amu;
+        Bm[siy][tix] = bmu;
+        __syncthreads();
+    }
+
+    // 4th -> radius range 
+#pragma unroll
+    for (int range = RADIUS; range < R8 - RADIUS; range += RADIUS)
+    {
+        // Load data to shared memory
+        siy = tiy + range;
+        piy = (siy + RADIUS) % R2;  // (siy + R3) % R2;
+        offset = reflectBorder(iy + range + R2, height) * stride;
+        As[piy][six] = A[offset + xs[RADIUS]];
+        Bs[piy][six] = B[offset + xs[RADIUS]];
+        if (left_cond)
+        {
+            As[piy][tix] = A[offset + xs[0]];
+            Bs[piy][tix] = B[offset + xs[0]];
+        }
+        if (righ_cond)
+        {
+            As[piy][pix] = A[offset + xs[R2]];
+            Bs[piy][pix] = B[offset + xs[R2]];
+        }
+
+        // Reduce col and save result to dst
+        ny = iy + range - RADIUS;
+        if (ix < width && ny < height)
+        {
+            piy = siy % R4;
+            amu = Am[piy][tix];
+            bmu = Bm[piy][tix];
+            for (int i = 1; i <= RADIUS; ++i)
+            {
+                piy = (siy - i) % R4;
+                niy = (siy + i) % R4;
+                amu += Am[piy][tix] + Am[niy][tix];
+                bmu += Bm[piy][tix] + Bm[niy][tix];
+            }
+            niy = ny * stride + ix; // niy -> index
+            dst[niy] = (amu * guidiance[niy] + bmu) * coef;
+        }    
+
+        // Reduce row for last-radius
+        siy += R2;
+        piy = siy % R2;
+        siy = siy % R4;
+        amu = As[piy][six];
+        bmu = Bs[piy][six];
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            amu += As[piy][six - i] + As[piy][six + i];
+            bmu += Bs[piy][six - i] + Bs[piy][six + i];
+        }
+        Am[siy][tix] = amu;
+        Bm[siy][tix] = bmu;
+        __syncthreads();
+    }
+
+    // Last 2 range
+    if (ix < width)
+    {
+        // Reduce row for last-radius
+        siy = tiy + R8 + RADIUS;
+        piy = siy % R2;
+        siy = siy % R4;
+        amu = As[piy][six];
+        bmu = Bs[piy][six];
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            amu += As[piy][six - i] + As[piy][six + i];
+            bmu += Bs[piy][six - i] + Bs[piy][six + i];
+        }
+        Am[siy][tix] = amu;
+        Bm[siy][tix] = bmu;
+
+        // Reduce col and save result to dst. -2
+        ny = iy + R8 - R2;
+        if (ny >= height) return;        
+        siy = tiy + R8 - RADIUS;
+        piy = siy % R4;
+        amu = Am[piy][tix];
+        bmu = Bm[piy][tix];
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            piy = (siy - i) % R4;
+            niy = (siy + i) % R4;
+            amu += Am[piy][tix] + Am[niy][tix];
+            bmu += Bm[piy][tix] + Bm[niy][tix];
+        }
+        niy = ny * stride + ix; // niy -> index
+        dst[niy] = (amu * guidiance[niy] + bmu) * coef;
+
+        // Reduce col and save result to dst. -1
+        ny += RADIUS;
+        if (ny >= height) return;        
+        siy += RADIUS;
+        piy = siy % R4;
+        amu = Am[piy][tix];
+        bmu = Bm[piy][tix];
+        for (int i = 1; i <= RADIUS; ++i)
+        {
+            piy = (siy - i) % R4;
+            niy = (siy + i) % R4;
+            amu += Am[piy][tix] + Am[niy][tix];
+            bmu += Bm[piy][tix] + Bm[niy][tix];
+        }
+        niy = ny * stride + ix; // niy -> index
+        dst[niy] = (amu * guidiance[niy] + bmu) * coef;
+    }
+}
+
+
 
 
 
@@ -598,4 +1044,50 @@ void hLinearTransform(float* src, float* dst, float* a, float* b, const int4& sw
 }
 
 
-
+void hGuidedFilter(float* d_guided, float* d_src, float* d_dst, float* d_A, float* d_B, float eps, int radius, int width, int height, int stride)
+{	
+    dim3 block(1, radius);
+    dim3 grid(1, iDivUp(height, 8 * radius));
+	const int ksz = 2 * radius + 1;
+    const float coef = 1.f / static_cast<float>(ksz * ksz);
+	switch (radius)
+	{
+	case 1:
+		block.x = 128; grid.x = iDivUp(width, block.x);
+		gCalcAB<1, 128><<<grid, block>>>(d_guided, d_src, d_A, d_B, eps, coef, width, height, stride);
+		gWeightByABm<1, 128><<<grid, block>>>(d_guided, d_A, d_B, d_dst, coef, width, height, stride);
+		break;
+	case 2:
+		block.x = 64; grid.x = iDivUp(width, block.x);
+		gCalcAB<2, 64><<<grid, block>>>(d_guided, d_src, d_A, d_B, eps, coef, width, height, stride);
+		gWeightByABm<2, 64><<<grid, block>>>(d_guided, d_A, d_B, d_dst, coef, width, height, stride);
+		break;
+	case 3:
+		block.x = 64; grid.x = iDivUp(width, block.x);
+		gCalcAB<3, 64><<<grid, block>>>(d_guided, d_src, d_A, d_B, eps, coef, width, height, stride);
+		gWeightByABm<3, 64><<<grid, block>>>(d_guided, d_A, d_B, d_dst, coef, width, height, stride);
+		break;
+	case 4:
+		block.x = 64; grid.x = iDivUp(width, block.x);
+		gCalcAB<4, 64><<<grid, block>>>(d_guided, d_src, d_A, d_B, eps, coef, width, height, stride);
+		gWeightByABm<4, 64><<<grid, block>>>(d_guided, d_A, d_B, d_dst, coef, width, height, stride);
+		break;
+	case 5:
+		block.x = 32; grid.x = iDivUp(width, block.x);
+		gCalcAB<5, 32><<<grid, block>>>(d_guided, d_src, d_A, d_B, eps, coef, width, height, stride);
+		gWeightByABm<5, 32><<<grid, block>>>(d_guided, d_A, d_B, d_dst, coef, width, height, stride);
+		break;
+	case 6:
+		block.x = 32; grid.x = iDivUp(width, block.x);
+		gCalcAB<6, 32><<<grid, block>>>(d_guided, d_src, d_A, d_B, eps, coef, width, height, stride);
+		gWeightByABm<6, 32><<<grid, block>>>(d_guided, d_A, d_B, d_dst, coef, width, height, stride);
+		break;
+	case 7:
+		block.x = 32; grid.x = iDivUp(width, block.x);
+		gCalcAB<7, 32><<<grid, block>>>(d_guided, d_src, d_A, d_B, eps, coef, width, height, stride);
+		gWeightByABm<7, 32><<<grid, block>>>(d_guided, d_A, d_B, d_dst, coef, width, height, stride);
+		break;
+	default:
+		break;
+	}
+}

@@ -2,20 +2,23 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/core/utils/logger.hpp>
 #include <opencv2/cudaimgproc.hpp>
+#include <opencv2/ximgproc.hpp>
 #include "guided_filter.h"
-#include "cuda_utils.h"
+#include "guided_filter_d.h"
 
 
 void cvGuidedFilterDemo(int argc, char** argv);
 void cudaGuidedFilterDemo(int argc, char** argv);
+void cudaSmallGuidedDemo(int argc, char** argv);
 
 
 int main(int argc, char** argv)
 {
     initDevice(0);
     cv::utils::logging::setLogLevel(cv::utils::logging::LOG_LEVEL_ERROR);
-    cvGuidedFilterDemo(argc, argv);
-    cudaGuidedFilterDemo(argc, argv);
+    // cvGuidedFilterDemo(argc, argv);
+    // cudaGuidedFilterDemo(argc, argv);
+    cudaSmallGuidedDemo(argc, argv);
 
     CHECK(cudaDeviceReset());
     printf("Procedure finished\n");
@@ -159,6 +162,153 @@ void cudaGuidedFilterDemo(int argc, char** argv)
     CUDA_SAFE_FREE(d_src);
     CUDA_SAFE_FREE(d_guidiance);
     CUDA_SAFE_FREE(d_dst);
+}
+
+
+double calcMaxAbsDiff(const cv::Mat& a, const cv::Mat& b)
+{
+    cv::Mat c;
+    cv::absdiff(a, b, c);
+    double maxdiff = DBL_MAX;
+    cv::minMaxLoc(c, NULL, &maxdiff);
+    return maxdiff;
+}
+
+
+void cudaSmallGuidedDemo(int argc, char** argv)
+{
+    // Parse config
+    int radius = 1;
+    float eps = 0.3f;
+    int nrepeats = 1;
+    std::string src_path = "../data/adobe_image_4.jpg";
+    std::string guided_path = "../data/adobe_gt_4.jpg";
+    if (argc > 1) radius      = std::atoi(argv[1]);
+    if (argc > 2) eps         = std::atof(argv[2]);
+    if (argc > 3) nrepeats    = std::atoi(argv[3]);
+    if (argc > 4) src_path    = argv[4];
+    if (argc > 5) guided_path = argv[5];
+
+    // Prepare data on host
+    cv::Mat h_src = cv::imread(src_path, cv::IMREAD_GRAYSCALE);
+    if (h_src.empty())
+    {
+        printf("Can not read source image from: %s\n", src_path.c_str());
+        return;
+    }
+    cv::Mat h_guided = cv::imread(guided_path, cv::IMREAD_GRAYSCALE);
+    if (h_guided.empty())
+    {
+        printf("Guided image is missing. We use median-filtered image as guided-image\n");
+        cv::medianBlur(h_src, h_guided, 3);
+    }
+    h_src.convertTo(h_src, CV_32FC1, 1.0 / 255.0);
+    h_guided.convertTo(h_guided, CV_32FC1, 1.0 / 255.0);
+    const int height = 2160;
+    const int width = 3840;
+    const int ksz = 2 * radius + 1;
+    cv::resize(h_src, h_src, cv::Size(width, height));
+    cv::resize(h_guided, h_guided, cv::Size(width, height));    
+
+    // Allocate data on device
+    float* d_src = nullptr;
+    float* d_guided = nullptr;
+    float* d_dst_cuda = nullptr;
+    float* d_A = nullptr;
+    float* d_B = nullptr;
+    size_t spitch = width * sizeof(float);
+    size_t dpitch = 0;
+    CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_src), &dpitch, spitch, height));
+    CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_guided), &dpitch, spitch, height));
+    CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_dst_cuda), &dpitch, spitch, height));
+    CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_A), &dpitch, spitch, height));
+    CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_B), &dpitch, spitch, height));
+    const int stride = static_cast<int>(dpitch / sizeof(float));
+
+    // Copy data from host to device
+    CHECK(cudaMemcpy2D(d_src, dpitch, h_src.data, spitch, spitch, height, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy2D(d_guided, dpitch, h_guided.data, spitch, spitch, height, cudaMemcpyHostToDevice));
+
+    // Guided filtering on host
+    cv::Mat h_dst;
+    cv::ximgproc::guidedFilter(h_guided, h_src, h_dst, radius, eps);
+
+    // Guided filtering by myself
+    cv::Mat h_dst_mycv, h_A_mycv, h_B_mycv, h_Pm_mycv, h_Im_mycv, h_IPm_mycv, h_IIm_mycv;
+    {
+        const cv::Size wsz(ksz, ksz);
+        
+        cv::blur(h_src, h_Pm_mycv, wsz);
+        cv::blur(h_guided, h_Im_mycv, wsz);
+        cv::blur(h_src.mul(h_guided), h_IPm_mycv, wsz);
+        cv::blur(h_guided.mul(h_guided), h_IIm_mycv, wsz);
+
+        cv::Mat am, bm;
+        h_A_mycv = (h_IPm_mycv- h_Pm_mycv.mul(h_Im_mycv)) / (h_IIm_mycv - h_Im_mycv.mul(h_Im_mycv) + eps);
+        h_B_mycv = h_Pm_mycv- h_A_mycv.mul(h_Im_mycv);
+        cv::blur(h_A_mycv, am, wsz);
+        cv::blur(h_B_mycv, bm, wsz);
+        h_dst_mycv = am.mul(h_guided) + bm;
+    }
+    
+    // Warm up
+    for (int i = 0; i < 100; i++)
+    {
+        hGuidedFilter(d_guided, d_src, d_dst_cuda, d_A, d_B, eps, radius, width, height, stride);
+    }
+
+    // Guided filter by CUDA
+    GpuTimer timer(0);
+    for (int i = 0; i < nrepeats; i++)
+    {
+        hGuidedFilter(d_guided, d_src, d_dst_cuda, d_A, d_B, eps, radius, width, height, stride);
+    }
+    CHECK(cudaDeviceSynchronize());
+    float t_elapsed = timer.read();
+
+    // Copy data from device to host
+    cv::Mat h_dst_cuda(height, width, CV_32FC1);
+    cv::Mat h_A_cuda(height, width, CV_32FC1);
+    cv::Mat h_B_cuda(height, width, CV_32FC1);
+    cv::Mat h_Pm_cuda(height, width, CV_32FC1);
+    cv::Mat h_Im_cuda(height, width, CV_32FC1);
+    cv::Mat h_IPm_cuda(height, width, CV_32FC1);
+    cv::Mat h_IIm_cuda(height, width, CV_32FC1);
+    CHECK(cudaMemcpy2D(h_dst_cuda.data, spitch, d_dst_cuda, dpitch, spitch, height, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy2D(h_A_cuda.data, spitch, d_A, dpitch, spitch, height, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy2D(h_B_cuda.data, spitch, d_B, dpitch, spitch, height, cudaMemcpyDeviceToHost));
+
+    // Verify
+    double maxdiff_cuda = calcMaxAbsDiff(h_dst, h_dst_cuda);
+    double maxdiff_mycv = calcMaxAbsDiff(h_dst, h_dst_mycv);
+    double maxdiff_mycu = calcMaxAbsDiff(h_dst_cuda, h_dst_mycv);
+    double maxdiff_A = calcMaxAbsDiff(h_A_cuda, h_A_mycv);
+    double maxdiff_B = calcMaxAbsDiff(h_B_cuda, h_B_mycv);
+    printf("max difference between host and device: %lf\n", maxdiff_cuda);
+    printf("max difference between host and myself: %lf\n", maxdiff_mycv);
+    printf("max difference between cuda and myself: %lf\n", maxdiff_mycu);
+    printf("max difference between host and device for A: %lf\n", maxdiff_A);
+    printf("max difference between host and device for B: %lf\n", maxdiff_B);
+    printf("Time cost of CUDA guided filter: %fms\n", t_elapsed / nrepeats);
+
+    // Save result
+    h_dst.convertTo(h_dst, CV_8U, 255.0);
+    h_dst_cuda.convertTo(h_dst_cuda, CV_8U, 255.0);
+    h_dst_mycv.convertTo(h_dst_mycv, CV_8U, 255.0);
+    std::string base_path = src_path.substr(0, src_path.rfind("."));
+    std::string cvres_path = base_path + "_cvres.png";
+    std::string cures_path = base_path + "_cures.png";
+    std::string myres_path = base_path + "_myres.png";
+    cv::imwrite(cvres_path, h_dst);
+    cv::imwrite(cures_path, h_dst_cuda);
+    cv::imwrite(myres_path, h_dst_mycv);
+
+    // Free memory
+    CUDA_SAFE_FREE(d_guided);
+    CUDA_SAFE_FREE(d_src);
+    CUDA_SAFE_FREE(d_dst_cuda);
+    CUDA_SAFE_FREE(d_A);
+    CUDA_SAFE_FREE(d_B);
 }
 
 
