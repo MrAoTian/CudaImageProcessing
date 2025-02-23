@@ -2,11 +2,11 @@
 
 
 
-class MinMaxFilter
+class CudaMorphology
 {
 public:
-    MinMaxFilter();
-    ~MinMaxFilter();
+    CudaMorphology();
+    ~CudaMorphology();
 
     /* Initialization */
     void init(int width_, int height_);

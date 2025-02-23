@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(CudaSortFilter)
+project(CudaMorphology)
 
 # set(CPACK_GENERATOR "ZIP")
 # include(CPack)
@@ -32,8 +32,8 @@ set(cuda_sources
 
 set(sources
   main.cpp
-  min_max_filter.cpp
-  min_max_filter.h
+  morphology.cpp
+  morphology.h
   cuda_utils.h
 )
 
@@ -43,11 +43,11 @@ include_directories(
 
 SET(CUDA_SEPARABLE_COMPILATION ON)
 
-cuda_add_executable(cuda_sort_filter ${cuda_sources} ${sources} OPTIONS -arch=sm_86)
+cuda_add_executable(cuda_mophology ${cuda_sources} ${sources} OPTIONS -arch=sm_86)
 
-set_target_properties(cuda_sort_filter PROPERTIES
+set_target_properties(cuda_mophology PROPERTIES
   COMPILE_FLAGS "${EXTRA_CXX_FLAGS}"			   
 )
 
-target_link_libraries(cuda_sort_filter ${CUDA_cudadevrt_LIBRARY} ${OpenCV_LIBS})
+target_link_libraries(cuda_mophology ${CUDA_cudadevrt_LIBRARY} ${OpenCV_LIBS})
 

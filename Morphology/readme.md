@@ -1,11 +1,11 @@
-# CUDA implementation of min, max filter
+# CUDA implementation of erode and dilate
 ## Build & Run
 ``` shell
 mkdir build
 cd build
 cmake ..
 make
-./cuda_sort_filter radius mode
+./cuda_morphology radius mode nrepeats
 ```
 ## Example
 - Original image

@@ -1,19 +1,21 @@
 #include "cuda_utils.h"
-#include "min_max_filter.h"
+#include "morphology.h"
+#include "image_process.h"
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/cudaimgproc.hpp>
 
 
-void minMaxFilterDemo(int argc, char** argv);
-void minMaxFilterRGBDemo(int argc, char** argv);
-void minMaxFilterLABDemo(int argc, char** argv);
+void morphologyDemo(int argc, char** argv);
+void morphologyRGBDemo(int argc, char** argv);
+void morphologyLABDemo(int argc, char** argv);
 
 
 int main(int argc, char** argv)
 {
-    minMaxFilterDemo(argc, argv);
-    minMaxFilterRGBDemo(argc, argv);
-    minMaxFilterLABDemo(argc, argv);
+    morphologyDemo(argc, argv);
+    // morphologyRGBDemo(argc, argv);
+    // morphologyLABDemo(argc, argv);
     
     CHECK(cudaDeviceReset());
     return EXIT_SUCCESS;
@@ -21,12 +23,14 @@ int main(int argc, char** argv)
 
 
 
-void minMaxFilterDemo(int argc, char** argv)
+void morphologyDemo(int argc, char** argv)
 {
-    int radius = 23;
+    int radius = 1;
     int mode = 1;
+    int nrepeats = 1;
     if (argc > 1) radius = atoi(argv[1]);
     if (argc > 2) mode = atoi(argv[2]);
+    if (argc > 3) nrepeats = atoi(argv[3]);
 
     std::string src_path = "../data/sea.png";
     cv::Mat image = cv::imread(src_path, cv::IMREAD_GRAYSCALE);
@@ -40,22 +44,35 @@ void minMaxFilterDemo(int argc, char** argv)
     const int height = image.rows;
 
     // Initialize min-max-filter
-    std::shared_ptr<MinMaxFilter> p_filter = std::make_shared<MinMaxFilter>();
+    std::shared_ptr<CudaMorphology> p_filter = std::make_shared<CudaMorphology>();
     p_filter->init(width, height);
 
     // Allocate memory on device 
     unsigned char* d_src = nullptr;
     unsigned char* d_dst = nullptr;
+    unsigned char* d_buff = nullptr;
     size_t spitch = width * sizeof(unsigned char);
     size_t dpitch = 0;
     CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_src), &dpitch, spitch, height));
     CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_dst), &dpitch, spitch, height));
+    CHECK(cudaMallocPitch(reinterpret_cast<void**>(&d_buff), &dpitch, spitch, height));
     CHECK(cudaMemcpy2D(d_src, dpitch, image.data, spitch, spitch, height, cudaMemcpyHostToDevice));
     const int stride = dpitch / sizeof(unsigned char);
 
+    // Warm up
+    for (int i = 0; i < 10; i++)
+    {
+        hMorphology(d_src, d_dst, d_buff, radius, mode, width, height, stride);
+    }
+
     // Run
     const int ksz = 2 * radius + 1;
-    p_filter->run(d_src, d_dst, ksz, mode);
+    GpuTimer timer(0);
+    for (int i = 0; i < nrepeats; i++)
+    {
+        p_filter->run(d_src, d_dst, ksz, mode);
+    }
+    float t0 = timer.read();
 
     // Copy result back to host
     cv::Mat dres(height, width, CV_8UC1);
@@ -84,14 +101,16 @@ void minMaxFilterDemo(int argc, char** argv)
     cv::Point maxp;
     cv::minMaxLoc(diff, NULL, &maxv, NULL, &maxp);
     printf("Max difference: %lf, at (%d, %d)\n", maxv, maxp.x, maxp.y);
+    printf("Radius: %d, Time of CUDA-Mophology: %fms\n", radius, t0 / nrepeats);
 
     // Free
     CUDA_SAFE_FREE(d_src);
     CUDA_SAFE_FREE(d_dst);
+    CUDA_SAFE_FREE(d_buff);
 }
 
 
-void minMaxFilterRGBDemo(int argc, char** argv)
+void morphologyRGBDemo(int argc, char** argv)
 {
     int radius = 23;
     int mode = 0;
@@ -109,8 +128,8 @@ void minMaxFilterRGBDemo(int argc, char** argv)
     const int width = image.cols;
     const int height = image.rows;
 
-    // Initialize min-max-filter
-    std::shared_ptr<MinMaxFilter> p_filter = std::make_shared<MinMaxFilter>();
+    // Initialize morphology filter
+    std::shared_ptr<CudaMorphology> p_filter = std::make_shared<CudaMorphology>();
     p_filter->init(width, height);
 
     // Allocate memory on device 
@@ -158,7 +177,7 @@ void minMaxFilterRGBDemo(int argc, char** argv)
 }
 
 
-void minMaxFilterLABDemo(int argc, char** argv)
+void morphologyLABDemo(int argc, char** argv)
 {
     int radius = 23;
     int mode = 0;
@@ -178,8 +197,8 @@ void minMaxFilterLABDemo(int argc, char** argv)
     cv::Mat lab;
     cv::cvtColor(image, lab, cv::COLOR_BGR2Lab);
 
-    // Initialize min-max-filter
-    std::shared_ptr<MinMaxFilter> p_filter = std::make_shared<MinMaxFilter>();
+    // Initialize morphology filter
+    std::shared_ptr<CudaMorphology> p_filter = std::make_shared<CudaMorphology>();
     p_filter->init(width, height);
 
     // Allocate memory on device 

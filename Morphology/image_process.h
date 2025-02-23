@@ -11,4 +11,5 @@ void hCalcRowM(unsigned char* mset1, unsigned char* mset2, unsigned char* dst, i
 /* Transpose */
 void hTranspose(unsigned char* src, unsigned char* dst, int width, int height, int sstride, int dstride);
 
-
+/* Dilate / Erode */
+void hMorphology(unsigned char* src, unsigned char* dst, unsigned char* buffer, int radius, int mode, int width, int height, int stride);
