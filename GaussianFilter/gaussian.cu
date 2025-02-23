@@ -423,17 +423,18 @@ void gaussianComparasion(int argc, char** argv)
     if (argc > 6) src_path = argv[6];
 
     // Random generate on host
-    cv::Mat image;
-    cv::Mat h_src(height, width, CV_32FC1);
+    cv::Mat image, h_src;
     if (src_path.empty())
     {
         cv::RNG rng;
+        h_src = cv::Mat(height, width, CV_32FC1);
         rng.fill(h_src, rng.UNIFORM, 0, 1, true);
     }
     else
     {
         image = cv::imread(src_path, cv::IMREAD_GRAYSCALE);
         image.convertTo(h_src, CV_32F, 1.0 / 255.0);
+        // cv::resize(h_src, h_src, cv::Size(width, height));
         height = h_src.rows;
         width = h_src.cols;
     }
@@ -477,7 +478,8 @@ void gaussianComparasion(int argc, char** argv)
     // Copy data from host to device
     CHECK(cudaMemcpy(d_pk1d.get(), kernel_1d.data, ksz * sizeof(float), cudaMemcpyHostToDevice));
     CHECK(cudaMemcpy(d_pk2d.get(), kernel_2d.data, ksz * ksz * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_src.get(), h_src.data, width * height * sizeof(float), cudaMemcpyHostToDevice));
+    // CHECK(cudaMemcpy(d_src.get(), h_src.data, width * height * sizeof(float), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy2D(d_src.get(), dpitch, h_src.data, spitch, spitch, height, cudaMemcpyHostToDevice));
 
 	// Warm up
 	dim3 block_warm(32, 32);
@@ -638,18 +640,25 @@ void gaussianComparasion(int argc, char** argv)
 
     if (!src_path.empty())
     {
+        h_src.convertTo(h_src, CV_8U, 255.0);
+        h_dst.convertTo(h_dst, CV_8U, 255.0);
         h_dst_naive.convertTo(h_dst_naive, CV_8U, 255.0);
         h_dst_const.convertTo(h_dst_const, CV_8U, 255.0);
         h_dst_share.convertTo(h_dst_share, CV_8U, 255.0);
         h_dst_split.convertTo(h_dst_split, CV_8U, 255.0);
         h_dst_optim.convertTo(h_dst_optim, CV_8U, 255.0);
+        h_dst_nppi.convertTo(h_dst_nppi, CV_8U, 255.0);
+        h_dst_cvcu.convertTo(h_dst_cvcu, CV_8U, 255.0);
         std::string base_path = src_path.substr(0, src_path.rfind("."));
-        cv::imwrite(base_path + "_gray.png", image);
+        cv::imwrite(base_path + "_gray.png", h_src);
+        cv::imwrite(base_path + "_cv.png", h_dst);
         cv::imwrite(base_path + "_naive.png", h_dst_naive);
         cv::imwrite(base_path + "_const.png", h_dst_const);
         cv::imwrite(base_path + "_share.png", h_dst_share);
         cv::imwrite(base_path + "_split.png", h_dst_split);
         cv::imwrite(base_path + "_optim.png", h_dst_optim);
+        cv::imwrite(base_path + "_nppi.png", h_dst_nppi);
+        cv::imwrite(base_path + "_cvcu.png", h_dst_cvcu);
     }
 }
 
