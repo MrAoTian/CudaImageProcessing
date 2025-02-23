@@ -42,13 +42,18 @@ void integralDemo(int argc, char** argv)
     unsigned char* d_src = nullptr;
     int* d_nppi_res = nullptr;
     int* d_cuda_res = nullptr;
+    int* d_cuda_res2 = nullptr;
     int* d_temp_buf = nullptr;
+    const int align_height = iDivUp(height, 4) * 4;
+    const int align_width = iDivUp(width, 4) * 4;
     size_t sbytes = height * width * sizeof(unsigned char);
     size_t dbytes = (height + 1) * (width + 1) * sizeof(int);
     size_t dbytes2 = height * width * sizeof(int);
+    size_t dbytes3 = align_height * align_width * sizeof(int);
     CHECK(cudaMalloc(reinterpret_cast<void**>(&d_src), sbytes));
     CHECK(cudaMalloc(reinterpret_cast<void**>(&d_nppi_res), dbytes));
     CHECK(cudaMalloc(reinterpret_cast<void**>(&d_cuda_res), dbytes2));
+    CHECK(cudaMalloc(reinterpret_cast<void**>(&d_cuda_res2), dbytes3));
     CHECK(cudaMalloc(reinterpret_cast<void**>(&d_temp_buf), dbytes2));
     CHECK(cudaMemcpy(d_src, image.data, sbytes, cudaMemcpyHostToDevice));
 
@@ -85,19 +90,39 @@ void integralDemo(int argc, char** argv)
     CHECK(cudaDeviceSynchronize());
     float t2 = timer.read();
 
+    // CUDA 2
+    for (int i = 0; i < nrepeats; i++)
+    {
+        hAligned4Integral(d_src, d_cuda_res2, width, height, width, align_width, align_height);
+    }
+    CHECK(cudaDeviceSynchronize());
+    float t3 = timer.read();
+
     // Copy to host
     cv::Mat h_nppi_res(height + 1, width + 1, CV_32SC1);
     cv::Mat h_cv_res(height + 1, width + 1, CV_32SC1);
     cv::Mat h_cuda_res(height, width, CV_32SC1);
+    cv::Mat h_cuda_res2(align_height, align_width, CV_32SC1);
     CHECK(cudaMemcpy(h_nppi_res.data, d_nppi_res, dbytes, cudaMemcpyDeviceToHost));
     d_integral.download(h_cv_res);
     CHECK(cudaMemcpy(h_cuda_res.data, d_cuda_res, height * width * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(h_cuda_res2.data, d_cuda_res2, align_height * align_width * sizeof(int), cudaMemcpyDeviceToHost));
 
+    // for (int i = 0; i < 16; i++)
+    // {
+    //     for (int j = 0; j < 16; j++)
+    //     {
+    //         printf("%5d ", h_cuda_res2.at<int>(i, j));
+    //     }
+    //     printf("\n");
+    // }
+    
     // Find max absdiff
     cv::Mat nppi_diff, cv_diff, cuda_diff, cuda_diff2;
     cv::absdiff(h_integral, h_nppi_res, nppi_diff);
     cv::absdiff(h_integral, h_cv_res, cv_diff);
     cv::absdiff(h_integral.rowRange(1, height + 1).colRange(1, width + 1), h_cuda_res, cuda_diff);
+    cv::absdiff(h_integral.rowRange(1, height + 1).colRange(1, width + 1), h_cuda_res2.rowRange(0, height).colRange(0, width), cuda_diff2);
 
     double nppi_maxdiff = 1000000;
     double cv_maxdiff = 1000000;
@@ -112,13 +137,16 @@ void integralDemo(int argc, char** argv)
     printf("Time of NPPI: %fms\n", t0 / nrepeats);
     printf("Time of OpenCV: %fms\n", (t1 - t0) / nrepeats);
     printf("Time of CUDA: %fms\n", (t2 - t1) / nrepeats);
+    printf("Time of aligned CUDA: %fms\n", (t3 - t2) / nrepeats);
     printf("Max difference of NPPI: %lf\n", nppi_maxdiff);
     printf("Max difference of OpenCV: %lf\n", cv_maxdiff);
     printf("Max difference of CUDA: %lf\n", cuda_maxdiff);
+    printf("Max difference of aligned CUDA: %lf\n", cuda_maxdiff2);
 
     CUDA_SAFE_FREE(d_src);
     CUDA_SAFE_FREE(d_nppi_res);
     CUDA_SAFE_FREE(d_cuda_res);
+    CUDA_SAFE_FREE(d_cuda_res2);
     CUDA_SAFE_FREE(d_temp_buf);
 }
 
